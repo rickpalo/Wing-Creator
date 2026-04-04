@@ -1,13 +1,13 @@
 """
-Wing Creator - Blender Add-on
-Creates wings from multiple connected airfoil sections.
-Compatible with Blender 4.5+
+Wing Creator — Blender Add-on
+Creates wings from parametric airfoil sections.
+Blender 4.5+  |  github.com/rickpalo/Wing-Creator/
 """
 
 bl_info = {
     "name": "Wing Creator",
     "author": "Wing Creator Contributors",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > Wing Creator",
     "description": "Create wings from parametric airfoil sections",
@@ -22,24 +22,23 @@ import json
 import math
 import os
 import re
-import urllib.request
-import zipfile
-import tempfile
 import shutil
+import tempfile
+import urllib.request
 from bpy.props import (
-    StringProperty, IntProperty, FloatProperty,
-    BoolProperty, EnumProperty, CollectionProperty, PointerProperty,
+    BoolProperty, CollectionProperty, EnumProperty,
+    FloatProperty, IntProperty, PointerProperty, StringProperty,
 )
-from bpy.types import Panel, Operator, PropertyGroup
+from bpy.types import Operator, Panel, PropertyGroup
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-ADDON_VERSION    = (0, 3, 0)
-GITHUB_API_URL   = "https://api.github.com/repos/rickpalo/Wing-Creator/releases/latest"
-GITHUB_REPO_URL  = "https://github.com/rickpalo/Wing-Creator/"
-WING_CREATOR_TAG = "wing_creator_data"   # custom-prop key on mesh objects
+ADDON_VERSION   = (0, 4, 0)
+GITHUB_API_URL  = "https://api.github.com/repos/rickpalo/Wing-Creator/releases/latest"
+GITHUB_REPO_URL = "https://github.com/rickpalo/Wing-Creator/"
+WING_TAG        = "wing_creator_data"   # custom-prop key on mesh objects
 
 # ---------------------------------------------------------------------------
 # .dat file cache
@@ -50,8 +49,9 @@ _DAT_CACHE: dict = {}
 
 def load_dat_file(path: str):
     """
-    Parse Selig- or Lednicer-format .dat files.
-    Returns normalized [(x,y)] (chord=1) or None on failure.
+    Parse Selig- or Lednicer-format .dat file.
+    Returns normalized [(x, y)] list (chord = 1) or None on failure.
+    Cached by absolute path.
     """
     if not path:
         return None
@@ -83,7 +83,7 @@ def load_dat_file(path: str):
     if len(rows) < 4:
         return None
 
-    # Lednicer: first row encodes point counts (x > 1)
+    # Lednicer: first row encodes point counts (x > 1.5)
     if rows[0][0] > 1.5:
         nu = int(round(rows[0][0]))
         nl = int(round(rows[0][1]))
@@ -102,7 +102,7 @@ def load_dat_file(path: str):
 
 
 # ---------------------------------------------------------------------------
-# NACA airfoil generators
+# NACA generators
 # ---------------------------------------------------------------------------
 
 def _cosine_xs(n: int):
@@ -116,27 +116,33 @@ def naca_4digit(code: str, n: int = 80):
     xs = _cosine_xs(n)
 
     def thick(x):
-        return (t / 0.2) * (0.2969*math.sqrt(max(x,0)) - 0.1260*x
-                             - 0.3516*x**2 + 0.2843*x**3 - 0.1015*x**4)
+        return (t / 0.2) * (0.2969 * math.sqrt(max(x, 0))
+                             - 0.1260 * x - 0.3516 * x**2
+                             + 0.2843 * x**3 - 0.1015 * x**4)
 
     def camber(x):
-        if not (p and m): return 0.0, 0.0
+        if not (p and m):
+            return 0.0, 0.0
         if x < p:
-            return (m/p**2)*(2*p*x - x**2), (2*m/p**2)*(p - x)
-        return (m/(1-p)**2)*((1-2*p) + 2*p*x - x**2), (2*m/(1-p)**2)*(p - x)
+            return (m / p**2) * (2*p*x - x**2), (2*m / p**2) * (p - x)
+        return ((m / (1-p)**2) * ((1 - 2*p) + 2*p*x - x**2),
+                (2*m / (1-p)**2) * (p - x))
 
     up, lo = [], []
     for x in xs:
-        yt = thick(x); yc, dyc = camber(x); th = math.atan(dyc)
-        up.append((x - yt*math.sin(th), yc + yt*math.cos(th)))
-        lo.append((x + yt*math.sin(th), yc - yt*math.cos(th)))
+        yt = thick(x)
+        yc, dyc = camber(x)
+        th = math.atan(dyc)
+        up.append((x - yt * math.sin(th), yc + yt * math.cos(th)))
+        lo.append((x + yt * math.sin(th), yc - yt * math.cos(th)))
     return up + list(reversed(lo[:-1]))
 
 
 def naca_5digit(code: str, n: int = 80):
     t = int(code[3:5]) / 100.0
-    lut = {210:(0.0580,361.4), 220:(0.1260,51.64), 230:(0.2025,15.957),
-           240:(0.2900,6.643), 250:(0.3910,3.230)}
+    lut = {210: (0.0580, 361.4), 220: (0.1260, 51.64),
+           230: (0.2025, 15.957), 240: (0.2900, 6.643),
+           250: (0.3910, 3.230)}
     key = int(code[:3])
     if key not in lut:
         return naca_4digit(code[:2] + code[3:5], n)
@@ -144,118 +150,158 @@ def naca_5digit(code: str, n: int = 80):
     xs = _cosine_xs(n)
 
     def thick(x):
-        return (t / 0.2) * (0.2969*math.sqrt(max(x,0)) - 0.1260*x
-                             - 0.3516*x**2 + 0.2843*x**3 - 0.1015*x**4)
+        return (t / 0.2) * (0.2969 * math.sqrt(max(x, 0))
+                             - 0.1260 * x - 0.3516 * x**2
+                             + 0.2843 * x**3 - 0.1015 * x**4)
 
     def camber(x):
         if x < r:
-            return (k1/6)*(x**3 - 3*r*x**2 + r**2*(3-r)*x), (k1/6)*(3*x**2 - 6*r*x + r**2*(3-r))
-        return (k1*r**3/6)*(1-x), -(k1*r**3/6)
+            return ((k1/6) * (x**3 - 3*r*x**2 + r**2*(3-r)*x),
+                    (k1/6) * (3*x**2 - 6*r*x + r**2*(3-r)))
+        return (k1*r**3/6) * (1-x), -(k1*r**3/6)
 
     up, lo = [], []
     for x in xs:
-        yt = thick(x); yc, dyc = camber(x); th = math.atan(dyc)
-        up.append((x - yt*math.sin(th), yc + yt*math.cos(th)))
-        lo.append((x + yt*math.sin(th), yc - yt*math.cos(th)))
+        yt = thick(x)
+        yc, dyc = camber(x)
+        th = math.atan(dyc)
+        up.append((x - yt * math.sin(th), yc + yt * math.cos(th)))
+        lo.append((x + yt * math.sin(th), yc - yt * math.cos(th)))
     return up + list(reversed(lo[:-1]))
 
 
 def get_airfoil_coords(code: str, dat_path: str, n: int = 80):
+    """Return normalized [(x,y)] (chord=1). .dat overrides NACA; fallback 2412."""
     if dat_path:
         c = load_dat_file(dat_path)
-        if c: return c
+        if c:
+            return c
     digits = re.sub(r'\D', '', code.strip().upper())
-    if len(digits) == 4: return naca_4digit(digits, n)
-    if len(digits) == 5: return naca_5digit(digits, n)
-    if len(digits) == 6: return naca_4digit(digits[2:], n)
+    if len(digits) == 4:
+        return naca_4digit(digits, n)
+    if len(digits) == 5:
+        return naca_5digit(digits, n)
+    if len(digits) == 6:
+        return naca_4digit(digits[2:], n)
     return naca_4digit("2412", n)
 
 
 # ---------------------------------------------------------------------------
 # Wing mesh builder
 # ---------------------------------------------------------------------------
+#
+# Coordinate convention
+#   +X  spanwise (root → tip, before offset)
+#   +Y  chordwise (leading-edge → trailing-edge)
+#   +Z  thickness / up
+#
+# Quarter-chord alignment: the 25 % chord point is kept at the section's
+# local Y origin so that, with zero sweep, the QC line is perfectly straight.
+#
+# Sweep shifts the tip's Y (chordwise) position.
+# Dihedral tilts the tip's Z position.
+# Both accumulate across sections for PER_SECTION mode.
 
-def _quarter_chord_y(chord: float) -> float:
-    """Y-position of the quarter-chord point for a section of given chord."""
-    return chord * 0.25
+
+def _section_dicts(props):
+    """Return a list of dicts describing each geometric section."""
+    mode = props.chord_mode
+    res  = props.resolution
+
+    if mode == 'CONSTANT':
+        return [{
+            'span':     props.wingspan,
+            'c_root':   props.chord_constant,
+            'c_tip':    props.chord_constant,
+            'airfoil':  props.airfoil_constant,
+            'dat_path': props.dat_path_constant,
+            'sweep':    props.sweep_constant,
+            'dihedral': props.dihedral_constant,
+            'res':      res,
+        }]
+
+    if mode == 'ROOT_TIP':
+        return [{
+            'span':     props.wingspan,
+            'c_root':   props.chord_root,
+            'c_tip':    props.chord_tip,
+            'airfoil':  props.airfoil_root_tip,
+            'dat_path': props.dat_path_root_tip,
+            'sweep':    props.sweep_root_tip,
+            'dihedral': props.dihedral_root_tip,
+            'res':      res,
+        }]
+
+    # PER_SECTION
+    out = []
+    for s in props.sections:
+        out.append({
+            'span':     s.length,
+            'c_root':   s.chord,
+            'c_tip':    s.chord,
+            'airfoil':  s.airfoil,
+            'dat_path': s.dat_path,
+            'sweep':    s.sweep,
+            'dihedral': s.dihedral,
+            'res':      res,
+        })
+    return out
 
 
 def build_wing_mesh(props, mesh) -> None:
-    """
-    Build wing geometry into `mesh`.
-
-    Coordinate convention
-    ---------------------
-    +X  spanwise (root → tip)
-    +Y  chordwise (leading-edge → trailing-edge)
-    +Z  thickness
-
-    The quarter-chord line is kept straight (constant Y by default).
-    Each section's profile is Y-shifted so its 25% chord point sits on
-    the accumulated quarter-chord Y.  Sweep and dihedral then offset the
-    tip position from the root position in X/Y/Z.
-    """
     bm = bmesh.new()
-    mode   = props.chord_mode
-    n_sec  = len(props.sections) if mode == 'PER_SECTION' else 1
+    sds = _section_dicts(props)
 
-    if mode == 'CONSTANT':
-        sections_data = [_constant_section_data(props)]
-    elif mode == 'ROOT_TIP':
-        sections_data = [_root_tip_section_data(props)]
-    else:
-        sections_data = [_per_section_data(props, i) for i in range(len(props.sections))]
+    if not sds:
+        bm.to_mesh(mesh)
+        bm.free()
+        return
 
-    # Accumulated origin of the current section root (x, y, z)
-    ox, oy, oz = 0.0, 0.0, 0.0
+    # Starting position (x, y, z) for the root of the first section.
+    # Offset from centerline shifts us along +X.
+    ox = props.centerline_offset if props.use_mirror else 0.0
+    oy = 0.0
+    oz = 0.0
 
-    for sd in sections_data:
-        sweep_rad    = math.radians(sd['sweep'])
-        dihedral_rad = math.radians(sd['dihedral'])
-        span         = sd['span']
-
-        # Tip offset from root origin, accounting for sweep & dihedral
-        # Sweep rotates the span vector in the XY plane (toward +Y = forward)
-        # Dihedral tilts it in the XZ plane (toward +Z = up)
-        dx = span * math.cos(dihedral_rad) * math.cos(sweep_rad)
-        dy = span * math.cos(dihedral_rad) * math.sin(sweep_rad)
-        dz = span * math.sin(dihedral_rad)
-
-        tx, ty, tz = ox + dx, oy + dy, oz + dz
-
+    for sd in sds:
+        sw_rad = math.radians(sd['sweep'])
+        dh_rad = math.radians(sd['dihedral'])
+        span   = sd['span']
         c_root = sd['c_root']
         c_tip  = sd['c_tip']
 
-        raw = get_airfoil_coords(sd['airfoil'], sd['dat_path'])
+        # Tip origin relative to root origin
+        dx = span * math.cos(dh_rad) * math.cos(sw_rad)
+        dy = span * math.cos(dh_rad) * math.sin(sw_rad)
+        dz = span * math.sin(dh_rad)
 
-        # Quarter-chord Y at root and tip
-        qc_root = _quarter_chord_y(c_root)
-        qc_tip  = _quarter_chord_y(c_tip)
+        tx, ty, tz = ox + dx, oy + dy, oz + dz
 
-        # Profile: normalized (x,y) → scale by chord, shift so quarter-chord
-        # lands at Y = oy (root) and Y = ty (tip)
-        def profile_verts(origin_x, origin_y, origin_z, chord, qc_offset, coords_raw):
+        raw = get_airfoil_coords(sd['airfoil'], sd['dat_path'], sd['res'])
+
+        def make_ring(ox_, oy_, oz_, chord, raw_coords):
             verts = []
-            for nx, ny in coords_raw:
-                # nx: chordwise 0→1 (LE→TE), ny: thickness
-                py = origin_y + (nx * chord - qc_offset)
-                pz = origin_z + ny * chord
-                verts.append(bm.verts.new((origin_x, py, pz)))
+            qc = chord * 0.25
+            for nx, ny in raw_coords:
+                verts.append(bm.verts.new((
+                    ox_,
+                    oy_ + nx * chord - qc,   # QC at oy_
+                    oz_ + ny * chord,
+                )))
             return verts
 
-        rv = profile_verts(ox, oy, oz, c_root, qc_root, raw)
-        tv = profile_verts(tx, ty, tz, c_tip,  qc_tip,  raw)
+        rv = make_ring(ox, oy, oz, c_root, raw)
+        tv = make_ring(tx, ty, tz, c_tip,  raw)
         bm.verts.ensure_lookup_table()
 
-        n_pts = len(rv)
-        for j in range(n_pts):
-            j1 = (j + 1) % n_pts
+        n = len(rv)
+        for j in range(n):
+            j1 = (j + 1) % n
             try:
                 bm.faces.new([rv[j], rv[j1], tv[j1], tv[j]])
             except Exception:
                 pass
 
-        # Next section root = this section's tip
         ox, oy, oz = tx, ty, tz
 
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
@@ -265,107 +311,148 @@ def build_wing_mesh(props, mesh) -> None:
     mesh.update()
 
 
-def _constant_section_data(props) -> dict:
-    return {
-        'span':     props.wingspan,
-        'c_root':   props.chord_constant,
-        'c_tip':    props.chord_constant,
-        'airfoil':  props.airfoil_constant,
-        'dat_path': props.dat_path_constant,
-        'sweep':    props.sweep_constant,
-        'dihedral': props.dihedral_constant,
-    }
+# ---------------------------------------------------------------------------
+# Empty / hierarchy helpers
+# ---------------------------------------------------------------------------
+
+def _root_chord(props) -> float:
+    """Return the chord at the wing root for empty sizing."""
+    mode = props.chord_mode
+    if mode == 'CONSTANT':
+        return props.chord_constant
+    if mode == 'ROOT_TIP':
+        return props.chord_root
+    if props.sections:
+        return props.sections[0].chord
+    return 0.3
 
 
-def _root_tip_section_data(props) -> dict:
-    return {
-        'span':     props.wingspan,
-        'c_root':   props.chord_root,
-        'c_tip':    props.chord_tip,
-        'airfoil':  props.airfoil_root_tip,
-        'dat_path': props.dat_path_root_tip,
-        'sweep':    props.sweep_root_tip,
-        'dihedral': props.dihedral_root_tip,
-    }
+def create_or_update_empty(context, props, wing_obj) -> bpy.types.Object:
+    """
+    Create (or find and update) the controller empty for this wing.
+    - Placed at (0, chord * 0.25, 0) in world space
+    - Display size = chord * 0.25
+    - wing_obj is parented to it (keep transform)
+    - Mirror modifier added/updated on wing_obj if use_mirror is True
+    """
+    chord = _root_chord(props)
+    qc    = chord * 0.25
+    name  = (props.wing_name.strip() or "Wing") + "_Root"
 
+    # Reuse existing empty if we know its name
+    empty_name = props.empty_object_name
+    if empty_name and empty_name in bpy.data.objects:
+        empty = bpy.data.objects[empty_name]
+    else:
+        empty = bpy.data.objects.new(name, None)
+        context.collection.objects.link(empty)
+        props.empty_object_name = empty.name
 
-def _per_section_data(props, i: int) -> dict:
-    s = props.sections[i]
-    return {
-        'span':     s.length,
-        'c_root':   s.chord,
-        'c_tip':    s.chord,
-        'airfoil':  s.airfoil,
-        'dat_path': s.dat_path,
-        'sweep':    s.sweep,
-        'dihedral': s.dihedral,
-    }
+    empty.name                 = name
+    empty.empty_display_type   = 'CUBE'
+    empty.empty_display_size   = qc
+    empty.location             = (0.0, qc, 0.0)
+
+    # Parent wing to empty (without moving the wing)
+    if wing_obj.parent != empty:
+        # Clear any previous parent first
+        mat_world = wing_obj.matrix_world.copy()
+        wing_obj.parent = empty
+        wing_obj.matrix_parent_inverse = empty.matrix_world.inverted()
+        wing_obj.matrix_world = mat_world
+
+    # Rename wing object to match wing name
+    display_name = props.wing_name.strip() or "Wing"
+    wing_obj.name = display_name
+
+    # ---- Mirror modifier ----
+    MOD_NAME = "WingCreator_Mirror"
+    # Remove stale modifier if mirror was turned off
+    if not props.use_mirror:
+        mod = wing_obj.modifiers.get(MOD_NAME)
+        if mod:
+            wing_obj.modifiers.remove(mod)
+    else:
+        mod = wing_obj.modifiers.get(MOD_NAME)
+        if mod is None:
+            mod = wing_obj.modifiers.new(name=MOD_NAME, type='MIRROR')
+        mod.use_axis[0]        = True   # mirror across X
+        mod.mirror_object      = empty
+        mod.use_mirror_merge   = True
+        mod.merge_threshold    = 0.001
+
+    return empty
 
 
 # ---------------------------------------------------------------------------
-# Serialization helpers  (props ↔ JSON stored on mesh custom property)
+# Serialization
 # ---------------------------------------------------------------------------
 
 def props_to_dict(props) -> dict:
-    """Serialize all wing_creator properties to a plain dict."""
     sections = []
     for s in props.sections:
         sections.append({
-            'airfoil':  s.airfoil,
-            'dat_path': s.dat_path,
-            'length':   s.length,
-            'chord':    s.chord,
-            'sweep':    s.sweep,
-            'dihedral': s.dihedral,
+            'airfoil':  s.airfoil,  'dat_path': s.dat_path,
+            'length':   s.length,   'chord':    s.chord,
+            'sweep':    s.sweep,    'dihedral': s.dihedral,
             'expanded': s.expanded,
         })
     return {
-        'chord_mode':        props.chord_mode,
-        'chord_constant':    props.chord_constant,
-        'airfoil_constant':  props.airfoil_constant,
-        'dat_path_constant': props.dat_path_constant,
-        'wingspan':          props.wingspan,
-        'sweep_constant':    props.sweep_constant,
-        'dihedral_constant': props.dihedral_constant,
-        'chord_root':        props.chord_root,
-        'chord_tip':         props.chord_tip,
-        'airfoil_root_tip':  props.airfoil_root_tip,
-        'dat_path_root_tip': props.dat_path_root_tip,
-        'sweep_root_tip':    props.sweep_root_tip,
-        'dihedral_root_tip': props.dihedral_root_tip,
-        'num_sections':      props.num_sections,
-        'sections':          sections,
-        'wing_created':      props.wing_created,
+        'wing_name':          props.wing_name,
+        'resolution':         props.resolution,
+        'use_mirror':         props.use_mirror,
+        'centerline_offset':  props.centerline_offset,
+        'chord_mode':         props.chord_mode,
+        # constant
+        'chord_constant':     props.chord_constant,
+        'airfoil_constant':   props.airfoil_constant,
+        'dat_path_constant':  props.dat_path_constant,
+        'wingspan':           props.wingspan,
+        'sweep_constant':     props.sweep_constant,
+        'dihedral_constant':  props.dihedral_constant,
+        # root/tip
+        'chord_root':         props.chord_root,
+        'chord_tip':          props.chord_tip,
+        'airfoil_root_tip':   props.airfoil_root_tip,
+        'dat_path_root_tip':  props.dat_path_root_tip,
+        'sweep_root_tip':     props.sweep_root_tip,
+        'dihedral_root_tip':  props.dihedral_root_tip,
+        # per-section
+        'num_sections':       props.num_sections,
+        'sections':           sections,
+        # state
+        'wing_created':       props.wing_created,
+        'empty_object_name':  props.empty_object_name,
     }
 
 
-def dict_to_props(data: dict, props, context) -> None:
-    """
-    Restore wing_creator properties from a dict.
-    Runs silently (no preview rebuild during restore).
-    """
+def dict_to_props(data: dict, props) -> None:
     _RESTORING[0] = True
     try:
-        props.chord_mode        = data.get('chord_mode', 'CONSTANT')
-        props.chord_constant    = data.get('chord_constant', 0.3)
-        props.airfoil_constant  = data.get('airfoil_constant', '2412')
-        props.dat_path_constant = data.get('dat_path_constant', '')
-        props.wingspan          = data.get('wingspan', 2.0)
-        props.sweep_constant    = data.get('sweep_constant', 0.0)
-        props.dihedral_constant = data.get('dihedral_constant', 0.0)
-        props.chord_root        = data.get('chord_root', 0.4)
-        props.chord_tip         = data.get('chord_tip', 0.2)
-        props.airfoil_root_tip  = data.get('airfoil_root_tip', '2412')
-        props.dat_path_root_tip = data.get('dat_path_root_tip', '')
-        props.sweep_root_tip    = data.get('sweep_root_tip', 0.0)
-        props.dihedral_root_tip = data.get('dihedral_root_tip', 0.0)
-        props.num_sections      = data.get('num_sections', 1)
-        props.wing_created      = data.get('wing_created', True)
-        props.is_editing        = False
+        props.wing_name          = data.get('wing_name', 'Wing')
+        props.resolution         = data.get('resolution', 80)
+        props.use_mirror         = data.get('use_mirror', False)
+        props.centerline_offset  = data.get('centerline_offset', 0.0)
+        props.chord_mode         = data.get('chord_mode', 'CONSTANT')
+        props.chord_constant     = data.get('chord_constant', 0.3)
+        props.airfoil_constant   = data.get('airfoil_constant', '2412')
+        props.dat_path_constant  = data.get('dat_path_constant', '')
+        props.wingspan           = data.get('wingspan', 2.0)
+        props.sweep_constant     = data.get('sweep_constant', 0.0)
+        props.dihedral_constant  = data.get('dihedral_constant', 0.0)
+        props.chord_root         = data.get('chord_root', 0.4)
+        props.chord_tip          = data.get('chord_tip', 0.2)
+        props.airfoil_root_tip   = data.get('airfoil_root_tip', '2412')
+        props.dat_path_root_tip  = data.get('dat_path_root_tip', '')
+        props.sweep_root_tip     = data.get('sweep_root_tip', 0.0)
+        props.dihedral_root_tip  = data.get('dihedral_root_tip', 0.0)
+        props.num_sections       = data.get('num_sections', 1)
+        props.wing_created       = data.get('wing_created', True)
+        props.is_editing         = False
+        props.empty_object_name  = data.get('empty_object_name', '')
 
-        sections_data = data.get('sections', [])
         props.sections.clear()
-        for sd in sections_data:
+        for sd in data.get('sections', []):
             s = props.sections.add()
             s.airfoil  = sd.get('airfoil', '2412')
             s.dat_path = sd.get('dat_path', '')
@@ -378,51 +465,53 @@ def dict_to_props(data: dict, props, context) -> None:
         _RESTORING[0] = False
 
 
-def reset_props(props, context) -> None:
-    """Reset all wing_creator properties to factory defaults."""
+def reset_props(props) -> None:
     _RESTORING[0] = True
     try:
-        props.chord_mode        = 'CONSTANT'
-        props.chord_constant    = 0.3
-        props.airfoil_constant  = '2412'
-        props.dat_path_constant = ''
-        props.wingspan          = 2.0
-        props.sweep_constant    = 0.0
-        props.dihedral_constant = 0.0
-        props.chord_root        = 0.4
-        props.chord_tip         = 0.2
-        props.airfoil_root_tip  = '2412'
-        props.dat_path_root_tip = ''
-        props.sweep_root_tip    = 0.0
-        props.dihedral_root_tip = 0.0
-        props.num_sections      = 1
+        props.wing_name          = 'Wing'
+        props.resolution         = 80
+        props.use_mirror         = False
+        props.centerline_offset  = 0.0
+        props.chord_mode         = 'CONSTANT'
+        props.chord_constant     = 0.3
+        props.airfoil_constant   = '2412'
+        props.dat_path_constant  = ''
+        props.wingspan           = 2.0
+        props.sweep_constant     = 0.0
+        props.dihedral_constant  = 0.0
+        props.chord_root         = 0.4
+        props.chord_tip          = 0.2
+        props.airfoil_root_tip   = '2412'
+        props.dat_path_root_tip  = ''
+        props.sweep_root_tip     = 0.0
+        props.dihedral_root_tip  = 0.0
+        props.num_sections       = 1
         props.sections.clear()
-        props.wing_created      = False
-        props.is_editing        = False
-        props.wing_object_name  = ''
-        props.preview           = False
+        props.wing_created       = False
+        props.is_editing         = False
+        props.wing_object_name   = ''
+        props.empty_object_name  = ''
+        props.preview            = False
+        props.update_available   = False
+        props.latest_version     = ''
+        props.latest_zip_url     = ''
     finally:
         _RESTORING[0] = False
 
 
-def save_props_to_object(props, obj) -> None:
-    """Serialize current props and store them in a custom property on obj."""
-    obj[WING_CREATOR_TAG] = json.dumps(props_to_dict(props))
+def save_to_obj(props, obj) -> None:
+    obj[WING_TAG] = json.dumps(props_to_dict(props))
 
 
-def load_props_from_object(obj, props, context) -> bool:
-    """
-    If obj carries wing_creator data, restore it into props.
-    Returns True if data was found and restored.
-    """
-    raw = obj.get(WING_CREATOR_TAG)
+def load_from_obj(obj, props) -> bool:
+    raw = obj.get(WING_TAG)
     if raw is None:
         return False
     try:
         data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except Exception:
         return False
-    dict_to_props(data, props, context)
+    dict_to_props(data, props)
     props.wing_object_name = obj.name
     return True
 
@@ -431,24 +520,34 @@ def load_props_from_object(obj, props, context) -> bool:
 # Preview / selection guard
 # ---------------------------------------------------------------------------
 
-# Flag to suppress preview rebuilds during property restoration
-_RESTORING = [False]
-
-# Track the previously active object to detect selection changes
+_RESTORING        = [False]
 _LAST_ACTIVE_NAME = [None]
 
 
 def _trigger_preview(self, context):
-    """Property update callback — rebuild mesh only when preview is live."""
     if _RESTORING[0]:
         return
+    # When chord_mode changes away from PER_SECTION, force sections = 1
     props = context.scene.wing_creator
+    if props.chord_mode != 'PER_SECTION':
+        _RESTORING[0] = True
+        try:
+            props.num_sections = 1
+            while len(props.sections) > 1:
+                props.sections.remove(len(props.sections) - 1)
+            if len(props.sections) == 0:
+                s = props.sections.add()
+                s.airfoil = '2412'; s.length = 1.0; s.chord = 0.3
+        finally:
+            _RESTORING[0] = False
+
     if not props.preview:
         return
     name = props.wing_object_name
     if name and name in bpy.data.objects:
-        build_wing_mesh(props, bpy.data.objects[name].data)
-        save_props_to_object(props, bpy.data.objects[name])
+        obj = bpy.data.objects[name]
+        build_wing_mesh(props, obj.data)
+        save_to_obj(props, obj)
 
 
 def _pu(self, context):
@@ -461,80 +560,77 @@ def _pu(self, context):
 
 class WingSection(PropertyGroup):
     expanded: BoolProperty(name="Expanded", default=True)
-    airfoil:  StringProperty(
-        name="Airfoil", description="4/5/6-digit NACA code. Overridden by .dat file.",
-        default="2412", maxlen=8, update=_pu)
-    dat_path: StringProperty(
-        name=".dat File", description="Selig/Lednicer .dat file. Overrides NACA code.",
-        default="", subtype='FILE_PATH', update=_pu)
-    length: FloatProperty(
-        name="Section Length", default=1.0, min=0.001, soft_max=100.0,
-        unit='LENGTH', update=_pu)
-    chord: FloatProperty(
-        name="Chord", default=0.3, min=0.001, soft_max=100.0,
-        unit='LENGTH', update=_pu)
-    sweep: FloatProperty(
-        name="Sweep", description="Leading-edge sweep angle (degrees, positive = aft sweep)",
-        default=0.0, min=-89.0, max=89.0, subtype='ANGLE', update=_pu)
-    dihedral: FloatProperty(
-        name="Dihedral", description="Dihedral angle (degrees, positive = tip up)",
-        default=0.0, min=-89.0, max=89.0, subtype='ANGLE', update=_pu)
+    airfoil:  StringProperty(name="Airfoil", default="2412", maxlen=8, update=_pu)
+    dat_path: StringProperty(name=".dat File", default="", subtype='FILE_PATH', update=_pu)
+    length:   FloatProperty(name="Section Length", default=1.0, min=0.001,
+                            soft_max=100.0, unit='LENGTH', update=_pu)
+    chord:    FloatProperty(name="Chord", default=0.3, min=0.001,
+                            soft_max=100.0, unit='LENGTH', update=_pu)
+    sweep:    FloatProperty(name="Sweep", default=0.0, min=-89.0, max=89.0,
+                            subtype='ANGLE', update=_pu)
+    dihedral: FloatProperty(name="Dihedral", default=0.0, min=-89.0, max=89.0,
+                            subtype='ANGLE', update=_pu)
 
 
 class WingCreatorProperties(PropertyGroup):
     header_expanded: BoolProperty(name="Header Expanded", default=True)
 
+    # ---- Wing-level settings ----
+    wing_name: StringProperty(
+        name="Wing Name", description="Name for the wing object and its root empty",
+        default="Wing", update=_pu)
+    resolution: IntProperty(
+        name="Resolution",
+        description="Number of vertices per airfoil profile (higher = smoother)",
+        default=80, min=8, max=512, update=_pu)
+    use_mirror: BoolProperty(
+        name="Mirror Across X",
+        description="Add a Mirror modifier and mirror the wing across the X axis",
+        default=False, update=_pu)
+    centerline_offset: FloatProperty(
+        name="Offset from Centerline",
+        description="Distance from X=0 to the root of the wing (active only when Mirror is on)",
+        default=0.0, min=0.0, soft_max=10.0, unit='LENGTH', update=_pu)
+
+    # ---- Chord mode ----
     chord_mode: EnumProperty(
-        name="Chord Mode",
+        name="Chord Type",
         items=[
-            ('CONSTANT',    "Constant Chord",   "One chord/airfoil for the whole wing"),
-            ('ROOT_TIP',    "Root & Tip Chord",  "Chord tapers linearly root→tip"),
+            ('CONSTANT',    "Constant Chord",   "Single chord + airfoil for whole wing"),
+            ('ROOT_TIP',    "Root & Tip Chord",  "Chord tapers root→tip"),
             ('PER_SECTION', "Chord Per Section", "Individual chord per section"),
         ],
         default='CONSTANT', update=_pu)
 
     # ---- Constant chord ----
-    chord_constant: FloatProperty(
-        name="Chord", default=0.3, min=0.001, soft_max=100.0,
-        unit='LENGTH', update=_pu)
-    airfoil_constant: StringProperty(
-        name="Airfoil", default="2412", maxlen=8, update=_pu)
-    dat_path_constant: StringProperty(
-        name=".dat File", default="", subtype='FILE_PATH', update=_pu)
-    wingspan: FloatProperty(
-        name="Wingspan", default=2.0, min=0.001, soft_max=1000.0,
-        unit='LENGTH', update=_pu)
-    sweep_constant: FloatProperty(
-        name="Sweep", description="Sweep angle in degrees (positive = aft)",
-        default=0.0, min=-89.0, max=89.0, subtype='ANGLE', update=_pu)
-    dihedral_constant: FloatProperty(
-        name="Dihedral", description="Dihedral angle in degrees (positive = tip up)",
-        default=0.0, min=-89.0, max=89.0, subtype='ANGLE', update=_pu)
+    chord_constant:    FloatProperty(name="Chord",    default=0.3, min=0.001,
+                                     soft_max=100.0, unit='LENGTH', update=_pu)
+    airfoil_constant:  StringProperty(name="Airfoil", default="2412", maxlen=8, update=_pu)
+    dat_path_constant: StringProperty(name=".dat File", default="",
+                                      subtype='FILE_PATH', update=_pu)
+    wingspan:          FloatProperty(name="Wingspan",  default=2.0, min=0.001,
+                                     soft_max=1000.0, unit='LENGTH', update=_pu)
+    sweep_constant:    FloatProperty(name="Sweep",    default=0.0, min=-89.0, max=89.0,
+                                     subtype='ANGLE', update=_pu)
+    dihedral_constant: FloatProperty(name="Dihedral", default=0.0, min=-89.0, max=89.0,
+                                     subtype='ANGLE', update=_pu)
 
     # ---- Root & Tip chord ----
-    chord_root: FloatProperty(
-        name="Root", default=0.4, min=0.001, soft_max=100.0,
-        unit='LENGTH', update=_pu)
-    chord_tip: FloatProperty(
-        name="Tip", default=0.2, min=0.001, soft_max=100.0,
-        unit='LENGTH', update=_pu)
-    airfoil_root_tip: StringProperty(
-        name="Airfoil", default="2412", maxlen=8, update=_pu)
-    dat_path_root_tip: StringProperty(
-        name=".dat File", default="", subtype='FILE_PATH', update=_pu)
-    wingspan: FloatProperty(
-        name="Wingspan", default=2.0, min=0.001, soft_max=1000.0,
-        unit='LENGTH', update=_pu)
-    sweep_root_tip: FloatProperty(
-        name="Sweep", description="Sweep angle in degrees (positive = aft)",
-        default=0.0, min=-89.0, max=89.0, subtype='ANGLE', update=_pu)
-    dihedral_root_tip: FloatProperty(
-        name="Dihedral", description="Dihedral angle in degrees (positive = tip up)",
-        default=0.0, min=-89.0, max=89.0, subtype='ANGLE', update=_pu)
+    chord_root:        FloatProperty(name="Root",    default=0.4, min=0.001,
+                                     soft_max=100.0, unit='LENGTH', update=_pu)
+    chord_tip:         FloatProperty(name="Tip",     default=0.2, min=0.001,
+                                     soft_max=100.0, unit='LENGTH', update=_pu)
+    airfoil_root_tip:  StringProperty(name="Airfoil", default="2412", maxlen=8, update=_pu)
+    dat_path_root_tip: StringProperty(name=".dat File", default="",
+                                      subtype='FILE_PATH', update=_pu)
+    sweep_root_tip:    FloatProperty(name="Sweep",    default=0.0, min=-89.0, max=89.0,
+                                     subtype='ANGLE', update=_pu)
+    dihedral_root_tip: FloatProperty(name="Dihedral", default=0.0, min=-89.0, max=89.0,
+                                     subtype='ANGLE', update=_pu)
 
     # ---- Per-section ----
     num_sections: IntProperty(name="Number of Sections", default=1, min=1, max=32)
-    sections: CollectionProperty(type=WingSection)
+    sections:     CollectionProperty(type=WingSection)
 
     # ---- State ----
     preview: BoolProperty(
@@ -544,27 +640,17 @@ class WingCreatorProperties(PropertyGroup):
     wing_created:      BoolProperty(name="Wing Created",      default=False)
     is_editing:        BoolProperty(name="Is Editing",        default=False)
     wing_object_name:  StringProperty(name="Wing Object Name", default="")
+    empty_object_name: StringProperty(name="Empty Object Name", default="")
 
-    # Update-check result storage
-    update_available:  BoolProperty(name="Update Available",  default=False)
-    latest_version:    StringProperty(name="Latest Version",  default="")
-    latest_zip_url:    StringProperty(name="Latest Zip URL",  default="")
+    # Update-check state
+    update_available: BoolProperty(name="Update Available", default=False)
+    latest_version:   StringProperty(name="Latest Version",  default="")
+    latest_zip_url:   StringProperty(name="Latest Zip URL",  default="")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Shared UI helpers
 # ---------------------------------------------------------------------------
-
-def _ensure_wing_object(context, props):
-    name = props.wing_object_name
-    if name and name in bpy.data.objects:
-        return bpy.data.objects[name]
-    me  = bpy.data.meshes.new("WingMesh")
-    obj = bpy.data.objects.new("Wing", me)
-    context.collection.objects.link(obj)
-    props.wing_object_name = obj.name
-    return obj
-
 
 def draw_airfoil_block(layout, owner, af_attr, dat_attr, target_str, locked):
     col = layout.column(align=True)
@@ -581,14 +667,25 @@ def draw_airfoil_block(layout, owner, af_attr, dat_attr, target_str, locked):
     op.target = target_str
 
 
+def _ensure_wing_object(context, props):
+    name = props.wing_object_name
+    if name and name in bpy.data.objects:
+        return bpy.data.objects[name]
+    me  = bpy.data.meshes.new("WingMesh")
+    obj = bpy.data.objects.new("Wing", me)
+    context.collection.objects.link(obj)
+    props.wing_object_name = obj.name
+    return obj
+
+
 # ---------------------------------------------------------------------------
 # Operators
 # ---------------------------------------------------------------------------
 
 class WINGCREATOR_OT_apply_sections(Operator):
-    """Sync the section list to the requested count."""
-    bl_idname = "wing_creator.apply_sections"
-    bl_label  = "Apply Sections"
+    """Sync section list to the requested count."""
+    bl_idname  = "wing_creator.apply_sections"
+    bl_label   = "Apply Sections"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -634,7 +731,8 @@ class WINGCREATOR_OT_import_dat(Operator):
             except (ValueError, IndexError):
                 self.report({'ERROR'}, f"Invalid target: {self.target}")
                 return {'CANCELLED'}
-        self.report({'INFO'}, f"Loaded {len(coords)} pts from {os.path.basename(self.filepath)}")
+        self.report({'INFO'},
+                    f"Loaded {len(coords)} pts from {os.path.basename(self.filepath)}")
         _trigger_preview(self, context)
         return {'FINISHED'}
 
@@ -663,27 +761,33 @@ class WINGCREATOR_OT_clear_dat(Operator):
 
 
 class WINGCREATOR_OT_create(Operator):
-    """Create the wing mesh."""
+    """Create the wing mesh and its controller empty."""
     bl_idname  = "wing_creator.create"
     bl_label   = "Create Wing"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         props = context.scene.wing_creator
+
+        # Remove stale wing object
         if props.wing_object_name and props.wing_object_name in bpy.data.objects:
             old = bpy.data.objects[props.wing_object_name]
             bpy.data.meshes.remove(old.data, do_unlink=True)
             props.wing_object_name = ""
-        obj = _ensure_wing_object(context, props)
-        build_wing_mesh(props, obj.data)
-        save_props_to_object(props, obj)
+
+        wing = _ensure_wing_object(context, props)
+        build_wing_mesh(props, wing.data)
+        empty = create_or_update_empty(context, props, wing)
+        save_to_obj(props, wing)
+
         bpy.ops.object.select_all(action='DESELECT')
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
+        wing.select_set(True)
+        context.view_layer.objects.active = wing
+
         props.wing_created = True
         props.is_editing   = False
-        _LAST_ACTIVE_NAME[0] = obj.name
-        self.report({'INFO'}, f"Wing created: {obj.name}")
+        _LAST_ACTIVE_NAME[0] = wing.name
+        self.report({'INFO'}, f"Wing '{wing.name}' created.")
         return {'FINISHED'}
 
 
@@ -705,9 +809,10 @@ class WINGCREATOR_OT_update(Operator):
 
     def execute(self, context):
         props = context.scene.wing_creator
-        obj   = _ensure_wing_object(context, props)
-        build_wing_mesh(props, obj.data)
-        save_props_to_object(props, obj)
+        wing  = _ensure_wing_object(context, props)
+        build_wing_mesh(props, wing.data)
+        create_or_update_empty(context, props, wing)
+        save_to_obj(props, wing)
         props.wing_created = True
         props.is_editing   = False
         self.report({'INFO'}, "Wing updated.")
@@ -715,10 +820,7 @@ class WINGCREATOR_OT_update(Operator):
 
 
 class WINGCREATOR_OT_check_updates(Operator):
-    """
-    Query the GitHub API for the latest release.
-    Reports the result and, if newer, shows an Install Update button.
-    """
+    """Query GitHub API for the latest release."""
     bl_idname = "wing_creator.check_updates"
     bl_label  = "Check for Updates"
 
@@ -731,8 +833,7 @@ class WINGCREATOR_OT_check_updates(Operator):
         try:
             req = urllib.request.Request(
                 GITHUB_API_URL,
-                headers={"User-Agent": "WingCreator-Blender-Addon"}
-            )
+                headers={"User-Agent": "WingCreator-Blender-Addon"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
         except Exception as e:
@@ -743,31 +844,28 @@ class WINGCREATOR_OT_check_updates(Operator):
         try:
             remote = tuple(int(x) for x in tag.split("."))
         except ValueError:
-            self.report({'WARNING'}, f"Could not parse remote version: {tag}")
+            self.report({'WARNING'}, f"Cannot parse remote version: {tag}")
             return {'CANCELLED'}
 
         props.latest_version = tag
 
-        # Find the zip asset
         for asset in data.get("assets", []):
             if asset.get("name", "").endswith(".zip"):
                 props.latest_zip_url = asset["browser_download_url"]
                 break
 
+        local_str = ".".join(str(x) for x in ADDON_VERSION)
         if remote > ADDON_VERSION:
             props.update_available = True
-            self.report({'INFO'}, f"Update available: v{tag}")
+            self.report({'INFO'}, f"Update available: v{tag}  (you have v{local_str})")
         else:
-            self.report({'INFO'}, f"You are up to date (v{'.'.join(str(x) for x in ADDON_VERSION)}).")
+            self.report({'INFO'}, f"Up to date (v{local_str}).")
 
         return {'FINISHED'}
 
 
 class WINGCREATOR_OT_install_update(Operator):
-    """
-    Download the latest release zip from GitHub and install it in-place,
-    replacing the running addon without requiring manual uninstall/reinstall.
-    """
+    """Download and install the latest release in-place."""
     bl_idname  = "wing_creator.install_update"
     bl_label   = "Install Update"
     bl_options = {'REGISTER'}
@@ -775,39 +873,27 @@ class WINGCREATOR_OT_install_update(Operator):
     def execute(self, context):
         props   = context.scene.wing_creator
         zip_url = props.latest_zip_url
-
         if not zip_url:
-            self.report({'ERROR'}, "No download URL — run Check for Updates first.")
+            self.report({'ERROR'}, "No URL — run Check for Updates first.")
             return {'CANCELLED'}
-
-        self.report({'INFO'}, f"Downloading from {zip_url} …")
 
         try:
             req = urllib.request.Request(
                 zip_url,
-                headers={"User-Agent": "WingCreator-Blender-Addon"}
-            )
+                headers={"User-Agent": "WingCreator-Blender-Addon"})
             with urllib.request.urlopen(req, timeout=60) as resp:
                 zip_data = resp.read()
         except Exception as e:
             self.report({'ERROR'}, f"Download failed: {e}")
             return {'CANCELLED'}
 
-        # Write zip to a temp file then hand it to Blender's built-in installer
         tmp_dir  = tempfile.mkdtemp()
         zip_path = os.path.join(tmp_dir, "wing_creator_update.zip")
         try:
             with open(zip_path, 'wb') as f:
                 f.write(zip_data)
-
-            # Use Blender's preferences operator to install (overwrite)
-            bpy.ops.preferences.addon_install(
-                overwrite=True,
-                filepath=zip_path,
-            )
-            # Re-enable the addon so the new code loads immediately
+            bpy.ops.preferences.addon_install(overwrite=True, filepath=zip_path)
             bpy.ops.preferences.addon_enable(module=__name__.split(".")[0])
-
         except Exception as e:
             self.report({'ERROR'}, f"Install failed: {e}")
             return {'CANCELLED'}
@@ -815,8 +901,9 @@ class WINGCREATOR_OT_install_update(Operator):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         props.update_available = False
-        self.report({'INFO'}, f"Wing Creator updated to v{props.latest_version}. "
-                              "Blender may need a restart to fully apply changes.")
+        self.report({'INFO'},
+                    f"Updated to v{props.latest_version}. "
+                    "A Blender restart is recommended.")
         return {'FINISHED'}
 
 
@@ -832,34 +919,25 @@ class WINGCREATOR_OT_open_docs(Operator):
 
 
 # ---------------------------------------------------------------------------
-# depsgraph handler — selection tracking
+# Selection-tracking handler
 # ---------------------------------------------------------------------------
 
 @bpy.app.handlers.persistent
-def _selection_changed_handler(scene, depsgraph):
-    """
-    Runs after every depsgraph update.
-    Detects active-object changes and restores/resets wing_creator props.
-    """
-    ctx_obj = getattr(bpy.context, 'active_object', None)
-    current_name = ctx_obj.name if ctx_obj else None
-
-    if current_name == _LAST_ACTIVE_NAME[0]:
-        return   # no change
-
-    _LAST_ACTIVE_NAME[0] = current_name
-    props = scene.wing_creator
-
-    if ctx_obj is None:
-        # Nothing selected → reset to defaults
-        reset_props(props, None)
+def _on_selection_change(scene, depsgraph):
+    ctx = bpy.context
+    active = getattr(ctx, 'active_object', None)
+    current = active.name if active else None
+    if current == _LAST_ACTIVE_NAME[0]:
         return
+    _LAST_ACTIVE_NAME[0] = current
 
-    # Try to restore from the selected object
-    restored = load_props_from_object(ctx_obj, props, None)
+    props = scene.wing_creator
+    if active is None:
+        reset_props(props)
+        return
+    restored = load_from_obj(active, props)
     if not restored:
-        # Selected object is not a wing_creator object → reset
-        reset_props(props, None)
+        reset_props(props)
 
 
 # ---------------------------------------------------------------------------
@@ -879,27 +957,39 @@ class WINGCREATOR_PT_main(Panel):
         locked = props.wing_created and not props.is_editing
         mode   = props.chord_mode
 
-        # ---- HEADER -------------------------------------------------------
+        # ── HEADER ──────────────────────────────────────────────────────────
         box = layout.box()
         row = box.row()
         row.prop(props, "header_expanded",
                  icon='TRIA_DOWN' if props.header_expanded else 'TRIA_RIGHT',
                  icon_only=True, emboss=False)
-        row.label(text="Wing Creator  v0.3.0", icon='MATFLUID')
+        row.label(text="Wing Creator  v0.4.0", icon='MATFLUID')
         if props.header_expanded:
             row = box.row(align=True)
-            row.operator("wing_creator.open_docs",    icon='URL',          text="Documentation")
+            row.operator("wing_creator.open_docs",     icon='URL',          text="Documentation")
             row.operator("wing_creator.check_updates", icon='FILE_REFRESH', text="Check for Updates")
-
             if props.update_available:
                 sub = box.column()
                 sub.alert = True
                 sub.label(text=f"Update available: v{props.latest_version}", icon='ERROR')
-                sub.operator("wing_creator.install_update", icon='IMPORT', text="Install Update Now")
+                sub.operator("wing_creator.install_update", icon='IMPORT',
+                             text="Install Update Now")
 
         layout.separator()
 
-        # ---- CHORD MODE ---------------------------------------------------
+        # ── WING-LEVEL SETTINGS ─────────────────────────────────────────────
+        col = layout.column()
+        col.enabled = not locked
+        col.prop(props, "wing_name",   text="Wing Name")
+        col.prop(props, "resolution",  text="Resolution")
+        row = col.row()
+        row.prop(props, "use_mirror",  text="Mirror Across X")
+        if props.use_mirror:
+            col.prop(props, "centerline_offset", text="Offset from Centerline")
+
+        layout.separator()
+
+        # ── CHORD TYPE ──────────────────────────────────────────────────────
         col = layout.column()
         col.enabled = not locked
         col.label(text="Chord Type:")
@@ -907,8 +997,8 @@ class WINGCREATOR_PT_main(Panel):
         col.separator()
 
         if mode == 'CONSTANT':
-            col.prop(props, "chord_constant")
-            col.prop(props, "wingspan")
+            col.prop(props, "chord_constant", text="Chord")
+            col.prop(props, "wingspan",        text="Wingspan")
             row = col.row(align=True)
             row.prop(props, "sweep_constant",    text="Sweep")
             row.prop(props, "dihedral_constant", text="Dihedral")
@@ -919,9 +1009,9 @@ class WINGCREATOR_PT_main(Panel):
 
         elif mode == 'ROOT_TIP':
             row = col.row(align=True)
-            row.prop(props, "chord_root")
-            row.prop(props, "chord_tip")
-            col.prop(props, "wingspan")
+            row.prop(props, "chord_root", text="Root")
+            row.prop(props, "chord_tip",  text="Tip")
+            col.prop(props, "wingspan",   text="Wingspan")
             row = col.row(align=True)
             row.prop(props, "sweep_root_tip",    text="Sweep")
             row.prop(props, "dihedral_root_tip", text="Dihedral")
@@ -930,51 +1020,48 @@ class WINGCREATOR_PT_main(Panel):
                                "airfoil_root_tip", "dat_path_root_tip",
                                "ROOT_TIP", locked)
 
-        else:  # PER_SECTION
-            col.label(text="Airfoil, chord, sweep & dihedral per section below", icon='INFO')
+        else:   # PER_SECTION
+            col.label(text="Airfoil, chord, sweep & dihedral per section", icon='INFO')
+            layout.separator()
 
-        layout.separator()
-
-        # ---- SECTION COUNT & PANELS (PER_SECTION only) --------------------
-        if mode == 'PER_SECTION':
+            # Section count
             row = layout.row(align=True)
             row.enabled = not locked
             row.prop(props, "num_sections")
             row.operator("wing_creator.apply_sections", icon='CHECKMARK', text="")
             layout.separator()
 
+            # Section panels
             for i, section in enumerate(props.sections):
-                box = layout.box()
-                row = box.row()
+                box2 = layout.box()
+                row = box2.row()
                 row.prop(section, "expanded",
                          icon='TRIA_DOWN' if section.expanded else 'TRIA_RIGHT',
                          icon_only=True, emboss=False)
                 row.label(text=f"Section {i + 1}", icon='MOD_ARRAY')
-
                 if section.expanded:
-                    inner = box.column()
+                    inner = box2.column()
                     inner.enabled = not locked
                     draw_airfoil_block(inner, section,
-                                       "airfoil", "dat_path",
-                                       str(i), locked)
+                                       "airfoil", "dat_path", str(i), locked)
                     inner.separator()
-                    inner.prop(section, "chord",    text="Chord")
-                    inner.prop(section, "length",   text="Section Length")
+                    inner.prop(section, "chord",  text="Chord")
+                    inner.prop(section, "length", text="Section Length")
                     row2 = inner.row(align=True)
                     row2.prop(section, "sweep",    text="Sweep")
                     row2.prop(section, "dihedral", text="Dihedral")
 
-            layout.separator()
+        layout.separator()
 
-        # ---- PREVIEW ------------------------------------------------------
+        # ── PREVIEW ─────────────────────────────────────────────────────────
         icon = 'HIDE_OFF' if props.preview else 'HIDE_ON'
         layout.prop(props, "preview", text="Live Preview", icon=icon)
         if props.preview and not props.wing_object_name:
-            layout.label(text="Press Create to initialize the preview.", icon='INFO')
+            layout.label(text="Press Create to initialize preview.", icon='INFO')
 
         layout.separator()
 
-        # ---- CREATE / EDIT / UPDATE ---------------------------------------
+        # ── CREATE / EDIT / UPDATE ──────────────────────────────────────────
         if not props.wing_created:
             layout.operator("wing_creator.create", icon='MESH_DATA',    text="Create")
         elif props.is_editing:
@@ -1007,13 +1094,13 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.wing_creator = PointerProperty(type=WingCreatorProperties)
-    if _selection_changed_handler not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(_selection_changed_handler)
+    if _on_selection_change not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_on_selection_change)
 
 
 def unregister():
-    if _selection_changed_handler in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(_selection_changed_handler)
+    if _on_selection_change in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_selection_change)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     if hasattr(bpy.types.Scene, "wing_creator"):

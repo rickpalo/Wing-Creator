@@ -1,0 +1,24 @@
+```yaml
+name: Build Release Zip
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build addon zip
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          zip -r wing_creator_${TAG}.zip wing_creator/
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wing_creator_*.zip
+```
